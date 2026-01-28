@@ -109,11 +109,13 @@ function EnvironmentModel({
 
 /* ===== Uploaded GLB ===== */
 function UploadedGLB({
+  id,
   url,
   position = [0, 0, 0],
   scale = 1,
   rotation = [0, 0, 0],
 }: {
+  id: string;
   url: string;
   position?: Vec3Tuple;
   scale?: number;
@@ -122,7 +124,7 @@ function UploadedGLB({
   const { scene } = useGLTF(url);
   const model = useMemo(() => scene.clone(true), [scene]);
   return (
-    <group position={position} rotation={rotation} scale={scale}>
+    <group position={position} rotation={rotation} scale={scale} userData={{ uploadId: id }}>
       <primitive object={model} />
     </group>
   );
@@ -161,28 +163,54 @@ function CursorTracker({
 
 /* ===== Drag Move ===== */
 function DragMove({
-  selectedId,
+  agvRef,
+  onPick,
   onMove,
-  groundY = -0.01,
+  onDrop,
 }: {
-  selectedId: string | null;
+  agvRef: React.MutableRefObject<THREE.Group | null>;
+  onPick: (id: string | null) => void;
   onMove: (pos: Vec3Tuple) => void;
-  groundY?: number;
+  onDrop: () => void;
 }) {
-  const { camera, gl } = useThree();
+  const { camera, gl, scene } = useThree();
   const raycaster = useMemo(() => new THREE.Raycaster(), []);
   const mouse = useMemo(() => new THREE.Vector2(), []);
-  const plane = useMemo(() => new THREE.Plane(new THREE.Vector3(0, 1, 0), -groundY), [groundY]);
+  const plane = useMemo(() => new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), []);
   const point = useMemo(() => new THREE.Vector3(), []);
   const draggingRef = useRef(false);
+  const dragYRef = useRef<number | null>(null);
 
   useEffect(() => {
     const onPointerDown = (e: PointerEvent) => {
-      if (!selectedId || e.button !== 0) return;
-      draggingRef.current = true;
+      if (e.button !== 0) return;
+      const rect = gl.domElement.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObjects(scene.children, true);
+      for (const h of hits) {
+        let cur: THREE.Object3D | null = h.object;
+        while (cur) {
+          if (agvRef.current && cur === agvRef.current) break;
+          const id = cur.userData?.uploadId as string | undefined;
+          if (id) {
+            const wp = new THREE.Vector3();
+            cur.getWorldPosition(wp);
+            dragYRef.current = wp.y;
+            onPick(id);
+            draggingRef.current = true;
+            return;
+          }
+          cur = cur.parent;
+        }
+      }
+      onPick(null);
     };
     const onPointerUp = () => {
+      if (draggingRef.current) onDrop();
       draggingRef.current = false;
+      dragYRef.current = null;
     };
     const onPointerMove = (e: PointerEvent) => {
       if (!draggingRef.current) return;
@@ -190,8 +218,10 @@ function DragMove({
       mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(mouse, camera);
+      const planeY = dragYRef.current ?? 0;
+      plane.set(new THREE.Vector3(0, 1, 0), -planeY);
       if (raycaster.ray.intersectPlane(plane, point)) {
-        onMove([point.x, groundY, point.z]);
+        onMove([point.x, planeY, point.z]);
       }
     };
     gl.domElement.addEventListener("pointerdown", onPointerDown);
@@ -204,7 +234,7 @@ function DragMove({
       gl.domElement.removeEventListener("pointerleave", onPointerUp);
       gl.domElement.removeEventListener("pointermove", onPointerMove);
     };
-  }, [camera, gl.domElement, mouse, onMove, plane, point, raycaster, selectedId, groundY]);
+  }, [agvRef, camera, gl.domElement, mouse, onDrop, onMove, onPick, plane, point, raycaster, scene]);
 
   return null;
 }
@@ -756,7 +786,7 @@ export default function Page() {
   const [pickupZ, setPickupZ] = useState(15);
   const [pickupLocked, setPickupLocked] = useState(false);
   const [uploads, setUploads] = useState<UploadedGlb[]>([]);
-  const [selectedUploadId, setSelectedUploadId] = useState<string | null>(null);
+  const [draggedUploadId, setDraggedUploadId] = useState<string | null>(null);
   const cursorPosRef = useRef<Vec3Tuple>([0, -0.01, 0]);
   const pickupPositions: Vec3Tuple[] = [[7.21, 0, pickupZ]];
   const environmentUrl = "/BuildingStatic.glb";
@@ -825,7 +855,7 @@ export default function Page() {
           position: "absolute",
           zIndex: 11,
           padding: 12,
-          bottom: 12,
+          bottom: 64,
           left: 12,
           background: "rgba(255, 255, 255, 0.9)",
           borderRadius: 8,
@@ -842,6 +872,9 @@ export default function Page() {
             if (!file) return;
             const url = URL.createObjectURL(file);
             let position = cursorPosRef.current;
+            if (agvRef.current) {
+              position = [agvRef.current.position.x, agvRef.current.position.y, agvRef.current.position.z];
+            }
             let scale = 1;
             const raw = localStorage.getItem("agv_upload_defaults");
             if (raw) {
@@ -879,13 +912,6 @@ export default function Page() {
                 key={u.id}
                 style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}
               >
-                <button
-                  type="button"
-                  onClick={() => setSelectedUploadId(u.id)}
-                  style={{ fontWeight: selectedUploadId === u.id ? 700 : 400 }}
-                >
-                  {selectedUploadId === u.id ? "Selected" : "Select"}
-                </button>
                 <span>{u.name}</span>
                 <input
                   type="range"
@@ -905,7 +931,7 @@ export default function Page() {
                   onClick={() => {
                     setUploads((prev) => prev.filter((p) => p.id !== u.id));
                     URL.revokeObjectURL(u.url);
-                    if (selectedUploadId === u.id) setSelectedUploadId(null);
+                    if (draggedUploadId === u.id) setDraggedUploadId(null);
                   }}
                 >
                   Hapus
@@ -934,7 +960,7 @@ export default function Page() {
 
         <EnvironmentModel url={environmentUrl} groundY={-0.01} />
         {uploads.map((u) => (
-          <UploadedGLB key={u.id} url={u.url} position={u.position} scale={u.scale} />
+          <UploadedGLB key={u.id} id={u.id} url={u.url} position={u.position} scale={u.scale} />
         ))}
 
         <AGV
@@ -977,12 +1003,22 @@ export default function Page() {
           }}
         />
         <DragMove
-          selectedId={selectedUploadId}
+          agvRef={agvRef}
+          onPick={(id) => setDraggedUploadId(id)}
           onMove={(pos) => {
-            if (!selectedUploadId) return;
+            if (!draggedUploadId) return;
             setUploads((prev) =>
-              prev.map((u) => (u.id === selectedUploadId ? { ...u, position: pos } : u))
+              prev.map((u) => (u.id === draggedUploadId ? { ...u, position: pos } : u))
             );
+          }}
+          onDrop={() => {
+            if (!draggedUploadId) return;
+            setUploads((prev) =>
+              prev.map((u) =>
+                u.id === draggedUploadId ? { ...u, position: [u.position[0], -0.01, u.position[2]] } : u
+              )
+            );
+            setDraggedUploadId(null);
           }}
         />
 
