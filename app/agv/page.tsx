@@ -7,6 +7,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type CamMode = "ORBIT" | "FOLLOW" | "FPV";
 type Vec3Tuple = [number, number, number];
 type UploadedGlb = { id: string; name: string; url: string; position: Vec3Tuple; scale: number };
+type Vec3 = { x: number; y: number; z: number };
 
 /* ===== Keyboard ===== */
 function useKeys() {
@@ -114,17 +115,30 @@ function UploadedGLB({
   position = [0, 0, 0],
   scale = 1,
   rotation = [0, 0, 0],
+  onReady,
 }: {
   id: string;
   url: string;
   position?: Vec3Tuple;
   scale?: number;
   rotation?: Vec3Tuple;
+  onReady?: (id: string, obj: THREE.Group | null) => void;
 }) {
   const { scene } = useGLTF(url);
   const model = useMemo(() => scene.clone(true), [scene]);
+  const groupRef = useRef<THREE.Group>(null);
+
+  useEffect(() => {
+    onReady?.(id, groupRef.current);
+  }, [id, onReady]);
   return (
-    <group position={position} rotation={rotation} scale={scale} userData={{ uploadId: id }}>
+    <group
+      ref={groupRef}
+      position={position}
+      rotation={rotation}
+      scale={scale}
+      userData={{ uploadId: id }}
+    >
       <primitive object={model} />
     </group>
   );
@@ -167,11 +181,13 @@ function DragMove({
   onPick,
   onMove,
   onDrop,
+  groundY,
 }: {
   agvRef: React.MutableRefObject<THREE.Group | null>;
   onPick: (id: string | null) => void;
   onMove: (pos: Vec3Tuple) => void;
   onDrop: () => void;
+  groundY: number;
 }) {
   const { camera, gl, scene } = useThree();
   const raycaster = useMemo(() => new THREE.Raycaster(), []);
@@ -180,8 +196,19 @@ function DragMove({
   const point = useMemo(() => new THREE.Vector3(), []);
   const draggingRef = useRef(false);
   const dragYRef = useRef<number | null>(null);
+  const dragPosRef = useRef<Vec3Tuple | null>(null);
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const arrowDownRef = useRef(false);
+  const dragModeRef = useRef<"Y" | "XZ" | null>(null);
+  const dragOffsetRef = useRef<THREE.Vector3 | null>(null);
 
   useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === "ArrowDown") arrowDownRef.current = true;
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "ArrowDown") arrowDownRef.current = false;
+    };
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
       const rect = gl.domElement.getBoundingClientRect();
@@ -195,9 +222,23 @@ function DragMove({
           if (agvRef.current && cur === agvRef.current) break;
           const id = cur.userData?.uploadId as string | undefined;
           if (id) {
+            e.preventDefault();
+            e.stopPropagation();
             const wp = new THREE.Vector3();
             cur.getWorldPosition(wp);
             dragYRef.current = wp.y;
+            dragPosRef.current = [wp.x, wp.y, wp.z];
+            lastPointerRef.current = { x: e.clientX, y: e.clientY };
+            dragModeRef.current = null;
+            plane.set(new THREE.Vector3(0, 1, 0), -wp.y);
+            if (raycaster.ray.intersectPlane(plane, point)) {
+              dragOffsetRef.current = new THREE.Vector3(wp.x - point.x, 0, wp.z - point.z);
+            } else {
+              dragOffsetRef.current = new THREE.Vector3(0, 0, 0);
+            }
+            if (!arrowDownRef.current) {
+              // snap disabled
+            }
             onPick(id);
             draggingRef.current = true;
             return;
@@ -211,30 +252,71 @@ function DragMove({
       if (draggingRef.current) onDrop();
       draggingRef.current = false;
       dragYRef.current = null;
+      dragPosRef.current = null;
+      lastPointerRef.current = null;
+      dragModeRef.current = null;
+      dragOffsetRef.current = null;
     };
     const onPointerMove = (e: PointerEvent) => {
       if (!draggingRef.current) return;
+      const currentPos = dragPosRef.current ?? [0, groundY, 0];
+      const last = lastPointerRef.current ?? { x: e.clientX, y: e.clientY };
+      if (!dragModeRef.current && !arrowDownRef.current) {
+        const dx = Math.abs(e.clientX - last.x);
+        const dy = Math.abs(e.clientY - last.y);
+        dragModeRef.current = dy > dx * 1.3 ? "Y" : "XZ";
+      }
+      if (arrowDownRef.current || dragModeRef.current === "Y") {
+        const dy = e.clientY - last.y;
+        const nextY = currentPos[1] - dy * 0.02;
+        const next: Vec3Tuple = [currentPos[0], nextY, currentPos[2]];
+        dragPosRef.current = next;
+        lastPointerRef.current = { x: e.clientX, y: e.clientY };
+        onMove(next);
+        return;
+      }
+      lastPointerRef.current = { x: e.clientX, y: e.clientY };
       const rect = gl.domElement.getBoundingClientRect();
       mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(mouse, camera);
-      const planeY = dragYRef.current ?? 0;
+      const planeY = dragYRef.current ?? currentPos[1] ?? groundY;
       plane.set(new THREE.Vector3(0, 1, 0), -planeY);
       if (raycaster.ray.intersectPlane(plane, point)) {
-        onMove([point.x, planeY, point.z]);
+        const offset = dragOffsetRef.current ?? new THREE.Vector3(0, 0, 0);
+        const next: Vec3Tuple = [point.x + offset.x, planeY, point.z + offset.z];
+        dragPosRef.current = next;
+        onMove(next);
       }
     };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
     gl.domElement.addEventListener("pointerdown", onPointerDown);
     gl.domElement.addEventListener("pointerup", onPointerUp);
     gl.domElement.addEventListener("pointerleave", onPointerUp);
     gl.domElement.addEventListener("pointermove", onPointerMove);
     return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
       gl.domElement.removeEventListener("pointerdown", onPointerDown);
       gl.domElement.removeEventListener("pointerup", onPointerUp);
       gl.domElement.removeEventListener("pointerleave", onPointerUp);
       gl.domElement.removeEventListener("pointermove", onPointerMove);
     };
-  }, [agvRef, camera, gl.domElement, mouse, onDrop, onMove, onPick, plane, point, raycaster, scene]);
+  }, [
+    agvRef,
+    camera,
+    gl.domElement,
+    mouse,
+    onDrop,
+    onMove,
+    onPick,
+    plane,
+    point,
+    raycaster,
+    scene,
+    groundY,
+  ]);
 
   return null;
 }
@@ -675,7 +757,7 @@ function MeshPicker({
   onSelect,
   agvRef,
 }: {
-  onHover: (value: { name: string; uuid: string; z: number }) => void;
+  onHover: (value: { name: string; uuid: string; z: number; uploadId?: string }) => void;
   onSelect: (value: { name: string; uuid: string; z: number }) => void;
   agvRef: React.MutableRefObject<THREE.Group | null>;
 }) {
@@ -690,6 +772,22 @@ function MeshPicker({
     z: 0,
   });
   const box = useMemo(() => new THREE.Box3(), []);
+  const findUploadId = (obj: THREE.Object3D | null) => {
+    let cur: THREE.Object3D | null = obj;
+    while (cur) {
+      const id = cur.userData?.uploadId as string | undefined;
+      if (id) return id;
+      cur = cur.parent;
+    }
+    return undefined;
+  };
+  const findSelectable = (obj: THREE.Object3D | null) => {
+    let cur: THREE.Object3D | null = obj;
+    while (cur?.parent && cur.parent.type !== "Scene") {
+      cur = cur.parent;
+    }
+    return cur ?? obj;
+  };
 
   const isDescendantOf = (obj: THREE.Object3D, ancestor: THREE.Object3D | null) => {
     let cur: THREE.Object3D | null = obj;
@@ -711,7 +809,7 @@ function MeshPicker({
         if (lastUuid.current) {
           lastUuid.current = "";
           hoveredRef.current = { name: "", uuid: "", z: 0 };
-          onHover(hoveredRef.current);
+          onHover({ ...hoveredRef.current, uploadId: undefined });
         }
         return;
       }
@@ -729,12 +827,20 @@ function MeshPicker({
         }
       }
       const hit = best ?? hits[0].object;
-      const name = hit.name || "(no name)";
-      if (hit.uuid !== lastUuid.current) {
-        lastUuid.current = hit.uuid;
-        hit.getWorldPosition(worldPos);
-        hoveredRef.current = { name, uuid: hit.uuid, z: worldPos.z };
-        onHover(hoveredRef.current);
+      let selectable = findSelectable(hit);
+      if (selectable) {
+        box.setFromObject(selectable);
+        const size = box.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z);
+        if (maxDim > 30) selectable = hit;
+      }
+      const target = selectable ?? hit;
+      const name = target.name || "(no name)";
+      if (target.uuid !== lastUuid.current) {
+        lastUuid.current = target.uuid;
+        target.getWorldPosition(worldPos);
+        hoveredRef.current = { name, uuid: target.uuid, z: worldPos.z };
+        onHover({ ...hoveredRef.current, uploadId: findUploadId(target) });
       }
     };
     const onPointerDown = (e: PointerEvent) => {
@@ -751,6 +857,43 @@ function MeshPicker({
   }, [camera, gl.domElement, mouse, raycaster, scene.children, onHover, onSelect, worldPos, agvRef, box]);
 
   return null;
+}
+
+/* ===== Hover Highlight ===== */
+function HoverHighlight({
+  hoveredUuid,
+  boxRef,
+  lineRef,
+}: {
+  hoveredUuid: string | null;
+  boxRef: React.MutableRefObject<THREE.Box3>;
+  lineRef: React.MutableRefObject<THREE.LineSegments | null>;
+}) {
+  const { scene } = useThree();
+  const geomRef = useRef(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)));
+  useFrame(() => {
+    if (!lineRef.current) return;
+    if (!hoveredUuid) {
+      lineRef.current.visible = false;
+      return;
+    }
+    const obj = scene.getObjectByProperty("uuid", hoveredUuid);
+    if (!obj) {
+      lineRef.current.visible = false;
+      return;
+    }
+    boxRef.current.setFromObject(obj);
+    const size = boxRef.current.getSize(new THREE.Vector3());
+    const center = boxRef.current.getCenter(new THREE.Vector3());
+    lineRef.current.position.copy(center);
+    lineRef.current.scale.set(size.x, size.y, size.z);
+    lineRef.current.visible = true;
+  });
+  return (
+    <lineSegments ref={lineRef} geometry={geomRef.current}>
+      <lineBasicMaterial color="#f59e0b" />
+    </lineSegments>
+  );
 }
 
 /* ===== Telemetry ===== */
@@ -782,13 +925,55 @@ export default function Page() {
   const initialAgvPos: Vec3Tuple = [8.01, 10.94, -28.61];
   const [agvPos, setAgvPos] = useState<Vec3Tuple>(initialAgvPos);
   const [prompt, setPrompt] = useState("");
-  const [hoveredMesh, setHoveredMesh] = useState({ name: "", uuid: "", z: 0 });
+  const [hoveredMesh, setHoveredMesh] = useState<{
+    name: string;
+    uuid: string;
+    z: number;
+    uploadId?: string;
+  }>({ name: "", uuid: "", z: 0 });
   const [pickupZ, setPickupZ] = useState(15);
   const [pickupLocked, setPickupLocked] = useState(false);
   const [uploads, setUploads] = useState<UploadedGlb[]>([]);
   const [draggedUploadId, setDraggedUploadId] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState("");
+  const [selectedPos, setSelectedPos] = useState<Vec3Tuple | null>(null);
+  const [carriedIds, setCarriedIds] = useState<string[]>([]);
+  const [pickupNotice, setPickupNotice] = useState("");
+  const [importMinimized, setImportMinimized] = useState(false);
+  const [hudMinimized, setHudMinimized] = useState(false);
+  const [simulateOpen, setSimulateOpen] = useState(false);
+  const [selectedUploadIds, setSelectedUploadIds] = useState<string[]>([]);
+  const [attachRules, setAttachRules] = useState<{ id: string; offset: Vec3Tuple }[]>([]);
+  const [hoverUploadId, setHoverUploadId] = useState<string | null>(null);
+  const [hiddenUuids, setHiddenUuids] = useState<string[]>([]);
+  const [groupName, setGroupName] = useState("");
+  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [groups, setGroups] = useState<
+    {
+      id: string;
+      name: string;
+      hidden: boolean;
+      items: { kind: "upload" | "uuid"; id: string }[];
+    }[]
+  >([]);
+  const [mappingLog, setMappingLog] = useState<
+    { agv: Vec3Tuple; glb: Vec3Tuple; offset: Vec3Tuple; name: string }[]
+  >([]);
   const cursorPosRef = useRef<Vec3Tuple>([0, -0.01, 0]);
+  const groundY = agvPos[1];
+  const uploadHistoryRef = useRef<UploadedGlb[][]>([]);
+  const pendingUndoRef = useRef<UploadedGlb[] | null>(null);
+  const uploadObjectMapRef = useRef<Map<string, THREE.Group>>(new Map());
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const highlightRef = useRef<THREE.LineSegments | null>(null);
+  const highlightBoxRef = useRef(new THREE.Box3());
   const pickupPositions: Vec3Tuple[] = [[7.21, 0, pickupZ]];
+  const initialCameraPos: Vec3Tuple = [
+    initialAgvPos[0] + 4,
+    initialAgvPos[1] + 4,
+    initialAgvPos[2] + 6,
+  ];
   const environmentUrl = "/BuildingStatic.glb";
   const showGround = true;
 
@@ -801,27 +986,183 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
-    return () => {
-      uploads.forEach((u) => URL.revokeObjectURL(u.url));
+    const raw = localStorage.getItem("agv_hidden_uuids");
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as string[];
+      if (parsed.length) {
+        if (sceneRef.current) {
+          parsed.forEach((uuid) => {
+            const obj = sceneRef.current?.getObjectByProperty("uuid", uuid);
+            if (obj) obj.visible = true;
+          });
+        }
+        localStorage.removeItem("agv_hidden_uuids");
+        setHiddenUuids([]);
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("agv_hidden_uuids", JSON.stringify(hiddenUuids));
+    if (!sceneRef.current) return;
+    hiddenUuids.forEach((uuid) => {
+      const obj = sceneRef.current?.getObjectByProperty("uuid", uuid);
+      if (obj) obj.visible = false;
+    });
+  }, [hiddenUuids]);
+
+  useEffect(() => {
+    const onHide = (e: KeyboardEvent) => {
+      if (e.code !== "Delete" && e.code !== "KeyX") return;
+      if (!sceneRef.current) return;
+      if (!hoveredMesh.uuid) return;
+      const obj = sceneRef.current.getObjectByProperty("uuid", hoveredMesh.uuid);
+      if (!obj) return;
+      obj.visible = false;
+      setHiddenUuids((prev) =>
+        prev.includes(hoveredMesh.uuid) ? prev : [...prev, hoveredMesh.uuid]
+      );
     };
+    window.addEventListener("keydown", onHide);
+    return () => window.removeEventListener("keydown", onHide);
+  }, [hoveredMesh.uuid]);
+
+  useEffect(() => {
+    const pickRadius = 2;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== "KeyQ") return;
+      setCarriedIds((prevCarried) => {
+        const agv = agvRef.current;
+        if (!agv) return prevCarried;
+        const nextCarried = new Set(prevCarried);
+        for (const rule of attachRules) {
+          const obj = uploadObjectMapRef.current.get(rule.id) ?? null;
+          if (!obj) continue;
+          if (nextCarried.has(rule.id)) {
+            const world = new THREE.Vector3();
+            obj.getWorldPosition(world);
+            const newPos: Vec3Tuple = [world.x, world.y, world.z];
+            if (sceneRef.current) sceneRef.current.attach(obj);
+            else agvRef.current?.parent?.attach(obj);
+            setUploads((prev) =>
+              prev.map((u) => (u.id === rule.id ? { ...u, position: newPos } : u))
+            );
+            nextCarried.delete(rule.id);
+            continue;
+          }
+          const world = new THREE.Vector3();
+          obj.getWorldPosition(world);
+          const dx = world.x - agvPos[0];
+          const dz = world.z - agvPos[2];
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          if (dist > pickRadius) continue;
+          agv.add(obj);
+          obj.position.set(rule.offset[0], rule.offset[1], rule.offset[2]);
+          setUploads((prev) =>
+            prev.map((u) => (u.id === rule.id ? { ...u, position: rule.offset } : u))
+          );
+          nextCarried.add(rule.id);
+        }
+        return Array.from(nextCarried);
+      });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [agvPos, attachRules]);
+
+  useEffect(() => {
+    const pickRadius = 2;
+    let near = false;
+    for (const rule of attachRules) {
+      if (carriedIds.includes(rule.id)) continue;
+      const obj = uploadObjectMapRef.current.get(rule.id);
+      const world = obj ? obj.getWorldPosition(new THREE.Vector3()) : null;
+      const tx = world ? world.x : 0;
+      const tz = world ? world.z : 0;
+      const dx = tx - agvPos[0];
+      const dz = tz - agvPos[2];
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist <= pickRadius) {
+        near = true;
+        break;
+      }
+    }
+    if (near) setPickupNotice("Apakah kamu mau mengambil benda ini? (Q)");
+    else if (carriedIds.length) setPickupNotice("Press Q to drop");
+    else setPickupNotice("");
+  }, [agvPos, attachRules, carriedIds]);
+
+  useEffect(() => {
+    const onUndo = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.code !== "KeyZ") return;
+      e.preventDefault();
+      const last = uploadHistoryRef.current.pop();
+      if (last) setUploads(last);
+    };
+    window.addEventListener("keydown", onUndo);
+    return () => window.removeEventListener("keydown", onUndo);
+  }, []);
+
+  useEffect(() => {
+    const raw = localStorage.getItem("agv_uploads");
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as UploadedGlb[];
+      if (parsed.length) setUploads(parsed);
+    } catch {
+      // ignore parse errors
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("agv_uploads", JSON.stringify(uploads));
   }, [uploads]);
 
   useEffect(() => {
-    const byName = uploads.reduce<Record<string, { position: Vec3Tuple; scale: number }>>(
-      (acc, u) => {
-        acc[u.name] = { position: u.position, scale: u.scale };
-        return acc;
-      },
-      {}
-    );
-    localStorage.setItem("agv_upload_defaults", JSON.stringify(byName));
+    localStorage.setItem("agv_mappings", JSON.stringify(mappingLog));
+  }, [mappingLog]);
+
+  useEffect(() => {
+    const raw = localStorage.getItem("agv_groups");
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as typeof groups;
+      if (parsed.length) setGroups(parsed);
+    } catch {
+      // ignore parse errors
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("agv_groups", JSON.stringify(groups));
+    if (!sceneRef.current) return;
+    groups.forEach((g) => {
+      g.items.forEach((item) => {
+        const obj =
+          item.kind === "upload"
+            ? uploadObjectMapRef.current.get(item.id) ?? null
+            : sceneRef.current?.getObjectByProperty("uuid", item.id) ?? null;
+        if (obj) obj.visible = !g.hidden;
+      });
+    });
+  }, [groups]);
+
+  useEffect(() => {
+    return () => {
+      uploads.forEach((u) => {
+        if (u.url.startsWith("blob:")) URL.revokeObjectURL(u.url);
+      });
+    };
   }, [uploads]);
 
   return (
     <div style={{ height: "100vh" }}>
       <div
         style={{
-          position: "absolute",
+          position: "fixed",
           zIndex: 10,
           padding: 12,
           top: 12,
@@ -831,28 +1172,73 @@ export default function Page() {
           pointerEvents: "none",
         }}
       >
-        <div>WASD = move</div>
-        <div>R/F = up/down (fly)</div>
-        <div>T = toggle fly mode</div>
-        <div>1 Orbit | 2 Follow | 3 FPV</div>
-        <div>
-          Fly: <b>{flyMode ? "ON" : "OFF"}</b>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+          <b>HUD</b>
+          <button
+            type="button"
+            onClick={() => setHudMinimized((v) => !v)}
+            style={{ pointerEvents: "auto" }}
+          >
+            {hudMinimized ? "Expand" : "Minimize"}
+          </button>
         </div>
-        <div>Pos: {agvPos.map((v) => v.toFixed(2)).join(", ")}</div>
-        <div>Pickup Z: {pickupZ.toFixed(2)}</div>
-        <div>Pickup Lock: {pickupLocked ? "ON" : "OFF"}</div>
-        {hoveredMesh.uuid && (
-          <div>
-            Hover: {hoveredMesh.name} ({hoveredMesh.uuid})
-          </div>
+        {!hudMinimized && (
+          <>
+            <div>WASD = move</div>
+            <div>R/F = up/down (fly)</div>
+            <div>T = toggle fly mode</div>
+            <div>1 Orbit | 2 Follow | 3 FPV</div>
+            <div>
+              Fly: <b>{flyMode ? "ON" : "OFF"}</b>
+            </div>
+            <div>Pos: {agvPos.map((v) => v.toFixed(2)).join(", ")}</div>
+            {selectedPos && (
+              <div>
+                Selected: {selectedPos.map((v) => v.toFixed(2)).join(", ")}
+              </div>
+            )}
+            {selectedPos && (
+              <div>
+                Δ:{" "}
+                {selectedPos
+                  .map((v, i) => (v - agvPos[i]).toFixed(2))
+                  .join(", ")}
+              </div>
+            )}
+            <div>Pickup Z: {pickupZ.toFixed(2)}</div>
+            <div>Pickup Lock: {pickupLocked ? "ON" : "OFF"}</div>
+            {hoveredMesh.uuid && (
+              <div>
+                Hover: {hoveredMesh.name} ({hoveredMesh.uuid})
+              </div>
+            )}
+            {hoveredMesh.uuid && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!sceneRef.current) return;
+                  const obj = sceneRef.current.getObjectByProperty("uuid", hoveredMesh.uuid);
+                  if (!obj) return;
+                  obj.visible = false;
+                  setHiddenUuids((prev) =>
+                    prev.includes(hoveredMesh.uuid) ? prev : [...prev, hoveredMesh.uuid]
+                  );
+                }}
+                style={{ pointerEvents: "auto", marginTop: 6 }}
+              >
+                Hide Now
+              </button>
+            )}
+            {prompt && <div>{prompt}</div>}
+            {pickupNotice && <div>{pickupNotice}</div>}
+            <b>Mode: {camMode}</b>
+          </>
         )}
-        {prompt && <div>{prompt}</div>}
-        <b>Mode: {camMode}</b>
       </div>
 
       <div
         style={{
-          position: "absolute",
+          position: "fixed",
           zIndex: 11,
           padding: 12,
           bottom: 64,
@@ -861,98 +1247,364 @@ export default function Page() {
           borderRadius: 8,
         }}
       >
-        <label style={{ display: "block", fontWeight: 600, marginBottom: 6 }}>
-          Import GLB
-        </label>
-        <input
-          type="file"
-          accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
-          onChange={(e) => {
-            const file = e.target.files?.[0];
-            if (!file) return;
-            const url = URL.createObjectURL(file);
-            let position = cursorPosRef.current;
-            if (agvRef.current) {
-              position = [agvRef.current.position.x, agvRef.current.position.y, agvRef.current.position.z];
-            }
-            let scale = 1;
-            const raw = localStorage.getItem("agv_upload_defaults");
-            if (raw) {
-              try {
-                const parsed = JSON.parse(raw) as Record<
-                  string,
-                  { position: Vec3Tuple; scale: number }
-                >;
-                const saved = parsed[file.name];
-                if (saved) {
-                  position = saved.position;
-                  scale = saved.scale;
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+          <label style={{ display: "block", fontWeight: 600 }}>Import GLB</label>
+          <button type="button" onClick={() => setImportMinimized((v) => !v)}>
+            {importMinimized ? "Expand" : "Minimize"}
+          </button>
+        </div>
+        {!importMinimized && (
+          <>
+            <input
+              type="file"
+              accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
+              onChange={async (e) => {
+                const input = e.currentTarget as HTMLInputElement;
+                const file = input.files?.[0];
+                if (!file) return;
+                input.value = "";
+                setUploadStatus("Uploading...");
+                const formData = new FormData();
+                formData.append("file", file);
+                const res = await fetch("/api/upload", { method: "POST", body: formData });
+                if (!res.ok) {
+                  setUploadStatus(`Upload failed: ${res.status}`);
+                  return;
                 }
-              } catch {
-                // ignore parse errors
-              }
-            }
-            setUploads((prev) => [
-              ...prev,
-              {
-                id: `${file.name}-${Date.now()}`,
-                name: file.name,
-                url,
-                position,
-                scale,
-              },
-            ]);
-            e.currentTarget.value = "";
-          }}
-        />
-        {uploads.length > 0 && (
-          <div style={{ marginTop: 8, fontSize: 12 }}>
-            {uploads.map((u) => (
-              <div
-                key={u.id}
-                style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}
+                const { url, name } = (await res.json()) as { url: string; name: string };
+                setUploadStatus("Upload success");
+                let position = cursorPosRef.current;
+                if (agvRef.current) {
+                  position = [
+                    agvRef.current.position.x,
+                    agvRef.current.position.y,
+                    agvRef.current.position.z,
+                  ];
+                }
+                let scale = 1;
+                setUploads((prev) => [
+                  ...prev,
+                  {
+                    id: `${name}-${Date.now()}`,
+                    name,
+                    url,
+                    position,
+                    scale,
+                  },
+                ]);
+              }}
+            />
+            {uploadStatus && <div style={{ marginTop: 6, fontSize: 12 }}>{uploadStatus}</div>}
+            {uploads.length > 0 && (
+              <div style={{ marginTop: 8, fontSize: 12 }}>
+                {uploads.map((u) => (
+                  <div
+                    key={u.id}
+                    style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}
+                  >
+                    <span>{u.name}</span>
+                    <input
+                      type="range"
+                      min={0.1}
+                      max={5}
+                      step={0.1}
+                      value={u.scale}
+                      onChange={(e) => {
+                        const next = Number(e.currentTarget.value);
+                        setUploads((prev) =>
+                          prev.map((p) => (p.id === u.id ? { ...p, scale: next } : p))
+                        );
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setUploads((prev) => prev.filter((p) => p.id !== u.id));
+                        if (u.url.startsWith("blob:")) URL.revokeObjectURL(u.url);
+                        await fetch("/api/delete", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ url: u.url }),
+                        });
+                        if (draggedUploadId === u.id) setDraggedUploadId(null);
+                      }}
+                    >
+                      Hapus
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {hiddenUuids.length > 0 && (
+              <button
+                type="button"
+                style={{ marginTop: 8 }}
+                onClick={() => {
+                  if (sceneRef.current) {
+                    hiddenUuids.forEach((uuid) => {
+                      const obj = sceneRef.current?.getObjectByProperty("uuid", uuid);
+                      if (obj) obj.visible = true;
+                    });
+                  }
+                  setHiddenUuids([]);
+                }}
               >
-                <span>{u.name}</span>
+                Restore Hidden Objects
+              </button>
+            )}
+            {/* Add Mapping / JSON export temporarily disabled */}
+          </>
+        )}
+      </div>
+
+      <div
+        style={{
+          position: "fixed",
+          zIndex: 12,
+          top: 12,
+          right: 12,
+          background: "rgba(255, 255, 255, 0.9)",
+          borderRadius: 8,
+          padding: 8,
+        }}
+      >
+        <button type="button" onClick={() => setSimulateOpen(true)}>
+          Simulate
+        </button>
+      </div>
+
+      {simulateOpen && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 20,
+            background: "rgba(0, 0, 0, 0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <div
+            style={{
+              width: "80vw",
+              maxWidth: 900,
+              background: "rgba(255, 255, 255, 0.96)",
+              borderRadius: 12,
+              padding: 20,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+              <h2 style={{ margin: 0 }}>Simulate</h2>
+              <button type="button" onClick={() => setSimulateOpen(false)}>
+                Close
+              </button>
+            </div>
+            <p style={{ marginTop: 8 }}>
+              Pilih object GLB lalu klik Add Rule. Q akan attach/detach semua rule yang dibuat.
+            </p>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!hoverUploadId) return;
+                  if (selectedUploadIds.includes(hoverUploadId)) return;
+                  setSelectedUploadIds((prev) => [...prev, hoverUploadId]);
+                }}
+              >
+                Use Hovered
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const rules = selectedUploadIds
+                    .map((id) => {
+                      const obj = uploadObjectMapRef.current.get(id);
+                      if (!obj) return null;
+                      const world = obj.getWorldPosition(new THREE.Vector3());
+                      const offset: Vec3Tuple = [
+                        world.x - agvPos[0],
+                        world.y - agvPos[1],
+                        world.z - agvPos[2],
+                      ];
+                      return { id, offset };
+                    })
+                    .filter(Boolean) as { id: string; offset: Vec3Tuple }[];
+                  if (!rules.length) return;
+                  setAttachRules((prev) => {
+                    const map = new Map(prev.map((r) => [r.id, r]));
+                    for (const r of rules) map.set(r.id, r);
+                    return Array.from(map.values());
+                  });
+                }}
+              >
+                Add Rule
+              </button>
+              <button type="button" onClick={() => setSelectedUploadIds([])}>
+                Clear Selection
+              </button>
+              <button type="button" onClick={() => setAttachRules([])}>
+                Clear Rules
+              </button>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+              <div>
+                <h3 style={{ margin: "8px 0" }}>Uploads</h3>
+                {uploads.map((u) => (
+                  <label key={u.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={selectedUploadIds.includes(u.id)}
+                      onChange={(e) => {
+                        setSelectedUploadIds((prev) =>
+                          e.target.checked ? [...prev, u.id] : prev.filter((id) => id !== u.id)
+                        );
+                      }}
+                    />
+                    <span>{u.name}</span>
+                  </label>
+                ))}
+              </div>
+              <div>
+                <h3 style={{ margin: "8px 0" }}>Rules</h3>
+                {attachRules.length === 0 && <div>Belum ada rule.</div>}
+                {attachRules.map((r) => (
+                  <div key={r.id}>
+                    {r.id} | offset: {r.offset.map((v) => v.toFixed(2)).join(", ")}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ marginTop: 16, borderTop: "1px solid #e5e7eb", paddingTop: 12 }}>
+              <h3 style={{ margin: "8px 0" }}>Group Manager</h3>
+              <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
                 <input
-                  type="range"
-                  min={0.1}
-                  max={5}
-                  step={0.1}
-                  value={u.scale}
-                  onChange={(e) => {
-                    const next = Number(e.currentTarget.value);
-                    setUploads((prev) =>
-                      prev.map((p) => (p.id === u.id ? { ...p, scale: next } : p))
-                    );
-                  }}
+                  type="text"
+                  placeholder="Group name"
+                  value={groupName}
+                  onChange={(e) => setGroupName(e.currentTarget.value)}
                 />
                 <button
                   type="button"
                   onClick={() => {
-                    setUploads((prev) => prev.filter((p) => p.id !== u.id));
-                    URL.revokeObjectURL(u.url);
-                    if (draggedUploadId === u.id) setDraggedUploadId(null);
+                    const name = groupName.trim();
+                    if (!name) return;
+                    setGroups((prev) => [
+                      ...prev,
+                      { id: `${name}-${Date.now()}`, name, hidden: false, items: [] },
+                    ]);
+                    setGroupName("");
                   }}
                 >
-                  Hapus
+                  Create Group
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!selectedGroupId || !hoveredMesh.uuid) return;
+                    setGroups((prev) =>
+                      prev.map((g) => {
+                        if (g.id !== selectedGroupId) return g;
+                        if (g.items.some((i) => i.id === hoveredMesh.uuid)) return g;
+                        return {
+                          ...g,
+                          items: [...g.items, { kind: "uuid", id: hoveredMesh.uuid }],
+                        };
+                      })
+                    );
+                  }}
+                >
+                  Add Hovered (Scene)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!selectedGroupId || !hoverUploadId) return;
+                    setGroups((prev) =>
+                      prev.map((g) => {
+                        if (g.id !== selectedGroupId) return g;
+                        if (g.items.some((i) => i.id === hoverUploadId)) return g;
+                        return {
+                          ...g,
+                          items: [...g.items, { kind: "upload", id: hoverUploadId }],
+                        };
+                      })
+                    );
+                  }}
+                >
+                  Add Hovered (Upload)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!selectedGroupId || selectedUploadIds.length === 0) return;
+                    setGroups((prev) =>
+                      prev.map((g) => {
+                        if (g.id !== selectedGroupId) return g;
+                        const existing = new Set(g.items.map((i) => i.id));
+                        const nextItems = [...g.items];
+                        selectedUploadIds.forEach((id) => {
+                          if (!existing.has(id)) nextItems.push({ kind: "upload", id });
+                        });
+                        return { ...g, items: nextItems };
+                      })
+                    );
+                  }}
+                >
+                  Add Selected Uploads
                 </button>
               </div>
-            ))}
+              {groups.length === 0 && <div>Belum ada group.</div>}
+              {groups.map((g) => (
+                <div key={g.id} style={{ marginBottom: 8 }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <b>{g.name}</b>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedGroupId(g.id)}
+                      style={{ fontWeight: selectedGroupId === g.id ? 700 : 400 }}
+                    >
+                      {selectedGroupId === g.id ? "Selected" : "Select"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setGroups((prev) =>
+                          prev.map((x) => (x.id === g.id ? { ...x, hidden: !x.hidden } : x))
+                        )
+                      }
+                    >
+                      {g.hidden ? "Show" : "Hide"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setGroups((prev) => prev.filter((x) => x.id !== g.id))}
+                    >
+                      Delete Group
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 12 }}>
+                    Items: {g.items.length}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
       <Canvas
-        camera={{ position: [4, 4, 6], fov: 55, near: 0.1, far: 2000 }}
-        onCreated={({ gl }) => {
+        camera={{ position: initialCameraPos, fov: 55, near: 0.1, far: 2000 }}
+        onCreated={({ gl, scene }) => {
           gl.setClearColor("#e5e7eb");
+          sceneRef.current = scene;
         }}
       >
         <ambientLight intensity={0.6} />
         <directionalLight position={[6, 8, 5]} intensity={1.2} />
 
         {showGround && (
-          <mesh rotation-x={-Math.PI / 2} position={[0, -0.01, 0]}>
+          <mesh rotation-x={-Math.PI / 2} position={[0, groundY, 0]}>
             <planeGeometry args={[50, 50]} />
             <meshStandardMaterial color="#e5e7eb" side={THREE.DoubleSide} />
           </mesh>
@@ -960,8 +1612,34 @@ export default function Page() {
 
         <EnvironmentModel url={environmentUrl} groundY={-0.01} />
         {uploads.map((u) => (
-          <UploadedGLB key={u.id} id={u.id} url={u.url} position={u.position} scale={u.scale} />
+          <UploadedGLB
+            key={u.id}
+            id={u.id}
+            url={u.url}
+            position={u.position}
+            scale={u.scale}
+            onReady={(id, obj) => {
+              if (obj) uploadObjectMapRef.current.set(id, obj);
+              else uploadObjectMapRef.current.delete(id);
+            }}
+          />
         ))}
+
+        {attachRules.map((r) => {
+          const obj = uploadObjectMapRef.current.get(r.id);
+          if (!obj || carriedIds.includes(r.id)) return null;
+          const world = obj.getWorldPosition(new THREE.Vector3());
+          return (
+            <mesh
+              key={`ring-${r.id}`}
+              rotation-x={-Math.PI / 2}
+              position={[world.x, groundY + 0.02, world.z]}
+            >
+              <ringGeometry args={[1.7, 2, 48]} />
+              <meshBasicMaterial color="#16a34a" transparent opacity={0.6} />
+            </mesh>
+          );
+        })}
 
         <AGV
           agvRef={agvRef}
@@ -989,6 +1667,7 @@ export default function Page() {
           agvRef={agvRef}
           onHover={(data) => {
             setHoveredMesh(data);
+            setHoverUploadId(data.uploadId ?? null);
             if (!data.uuid || pickupLocked) return;
             setPickupZ(data.z);
           }}
@@ -997,6 +1676,11 @@ export default function Page() {
             setPickupLocked(true);
           }}
         />
+        <HoverHighlight
+          hoveredUuid={hoveredMesh.uuid || null}
+          boxRef={highlightBoxRef}
+          lineRef={highlightRef}
+        />
         <CursorTracker
           onMove={(pos) => {
             cursorPosRef.current = pos;
@@ -1004,25 +1688,41 @@ export default function Page() {
         />
         <DragMove
           agvRef={agvRef}
-          onPick={(id) => setDraggedUploadId(id)}
+          onPick={(id) => {
+            setDraggedUploadId(id);
+            setIsDragging(!!id);
+            if (id) {
+              pendingUndoRef.current = uploads.map((u) => ({
+                ...u,
+                position: [...u.position] as Vec3Tuple,
+              }));
+            }
+            if (!id) {
+              setSelectedPos(null);
+              return;
+            }
+            const found = uploads.find((u) => u.id === id);
+            if (found) setSelectedPos(found.position);
+          }}
           onMove={(pos) => {
             if (!draggedUploadId) return;
             setUploads((prev) =>
               prev.map((u) => (u.id === draggedUploadId ? { ...u, position: pos } : u))
             );
+            setSelectedPos(pos);
           }}
           onDrop={() => {
-            if (!draggedUploadId) return;
-            setUploads((prev) =>
-              prev.map((u) =>
-                u.id === draggedUploadId ? { ...u, position: [u.position[0], -0.01, u.position[2]] } : u
-              )
-            );
+            if (pendingUndoRef.current) {
+              uploadHistoryRef.current.push(pendingUndoRef.current);
+              pendingUndoRef.current = null;
+            }
             setDraggedUploadId(null);
+            setIsDragging(false);
           }}
+          groundY={groundY}
         />
 
-        {camMode === "ORBIT" && <OrbitControls ref={controlsRef} />}
+        {camMode === "ORBIT" && <OrbitControls ref={controlsRef} enabled={!isDragging} />}
       </Canvas>
     </div>
   );
